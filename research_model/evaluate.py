@@ -15,6 +15,7 @@ import tensorflow as tf
 from .config import ResearchModelConfig
 from .dataset import VideoSequenceDataset, VideoLevelSplitter
 from .utils import compute_classification_metrics, measure_inference_latency
+from typing import Optional
 
 
 def parse_args():

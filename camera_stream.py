@@ -14,6 +14,7 @@ import threading
 import numpy as np
 import pandas as pd
 from datetime import datetime
+from collections import deque
 from typing import Optional, Dict, Any, List
 from fall_detector import RealtimeFallDetector
 
@@ -55,6 +56,7 @@ class CameraStreamManager:
 
         self.capture_thread = None
         self.inference_thread = None
+        self.lstm_thread = None
 
         self.frame_lock = threading.Lock()
         self.latest_raw_frame = None
@@ -67,6 +69,20 @@ class CameraStreamManager:
         self.first_capture_received = False
         self.first_frame_received = False
         self.fps = 0.0
+
+        # MobileNetV2-LSTM Fall Detection Pipeline
+        self.lstm_model_path = os.environ.get("FALL_MODEL_PATH", "research_model/best_fall_model.keras")
+        self.lstm_threshold = float(os.environ.get("FALL_THRESHOLD", 0.50))
+        self.lstm_model = None
+        self.sequence_buffer = deque(maxlen=15)
+        self.buffer_lock = threading.Lock()
+        self.latest_fall_prob = 0.0
+        self.latest_lstm_status = "INITIALIZING"
+        self.lstm_alert_latched = False
+        self.lstm_inference_count = 0
+        self.last_lstm_time = 0.0
+        self.last_sample_time = 0.0
+        self.sampling_interval = 1.0 / 3.0  # 3 FPS downsampling (~0.333s)
 
         self.alarm_lock = threading.Lock()
         self.alarm_active = False
@@ -131,13 +147,22 @@ class CameraStreamManager:
             self.first_frame_received = False
             self.fps = 0.0
 
+        with self.buffer_lock:
+            self.sequence_buffer.clear()
+        self.latest_fall_prob = 0.0
+        self.latest_lstm_status = "INITIALIZING"
+        self.lstm_alert_latched = False
+        self.last_sample_time = time.time()
+
         self.is_running = True
 
         self.capture_thread = threading.Thread(target=self._capture_loop, args=(source,), daemon=True)
         self.inference_thread = threading.Thread(target=self._inference_loop, daemon=True)
+        self.lstm_thread = threading.Thread(target=self._lstm_worker_loop, daemon=True)
 
         self.capture_thread.start()
         self.inference_thread.start()
+        self.lstm_thread.start()
         return True
 
     def disconnect(self):
@@ -158,6 +183,10 @@ class CameraStreamManager:
         if self.inference_thread and self.inference_thread.is_alive():
             self.inference_thread.join(timeout=1.0)
         self.inference_thread = None
+
+        if self.lstm_thread and self.lstm_thread.is_alive():
+            self.lstm_thread.join(timeout=1.0)
+        self.lstm_thread = None
 
         with self.alarm_lock:
             self.alarm_active = False
@@ -269,13 +298,27 @@ class CameraStreamManager:
                 annotated = target_frame.copy()
                 new_events = []
 
-            # Master HUD Overlay
-            status_text = "ALARM: FALL DETECTED" if self.alarm_active else "NORMAL"
-            hud_bg = (0, 0, 180) if self.alarm_active else (20, 20, 20)
+            # 3 FPS temporal frame sampling for MobileNetV2-LSTM sequence buffer
+            now_sample = time.time()
+            if (now_sample - self.last_sample_time) >= self.sampling_interval:
+                try:
+                    resized = cv2.resize(target_frame, (224, 224), interpolation=cv2.INTER_AREA)
+                    rgb_frame = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32)
+                    with self.buffer_lock:
+                        self.sequence_buffer.append(rgb_frame)
+                    self.last_sample_time = now_sample
+                except Exception:
+                    pass
+
+            # Master HUD Overlay with MobileNetV2-LSTM Fall Telemetry
+            prob_pct = self.latest_fall_prob * 100.0
+            is_fall_active = self.alarm_active or (self.latest_lstm_status == "FALL_ALERT")
+            status_text = "ALARM: FALL DETECTED" if is_fall_active else "NORMAL"
+            hud_bg = (0, 0, 180) if is_fall_active else (20, 20, 20)
 
             height, width = annotated.shape[:2]
             cv2.rectangle(annotated, (0, 0), (width, 36), hud_bg, -1)
-            hud_text = f"SafeCCTV [LIVE] | Laptop Webcam | {timestamp_str} | Status: {status_text} | {self.fps:.1f} FPS"
+            hud_text = f"SafeCCTV [MobileNetV2-LSTM] | P(Fall): {prob_pct:.1f}% | {timestamp_str} | Status: {status_text} | {self.fps:.1f} FPS"
             cv2.putText(
                 annotated,
                 hud_text,
@@ -285,6 +328,10 @@ class CameraStreamManager:
                 (255, 255, 255),
                 2
             )
+
+            # Draw alert border if fall is triggered
+            if is_fall_active:
+                cv2.rectangle(annotated, (4, 4), (width - 4, height - 4), (0, 0, 255), 3)
 
             # Trigger fall event handling
             if new_events:
@@ -342,6 +389,119 @@ class CameraStreamManager:
                 self.alarm_active = True
                 self.alarm_muted = False
                 self.alarm_acknowledged = False
+
+    def _lstm_worker_loop(self):
+        """
+        Dedicated background worker for MobileNetV2-LSTM Spatio-Temporal inference.
+        Evaluates 15-frame rolling temporal sequences (sampled at 3 FPS) without blocking
+        the camera capture thread or Streamlit UI rendering.
+        """
+        model = self.lstm_model
+        if model is None:
+            try:
+                from mock_detector import load_fall_model
+                model = load_fall_model(self.lstm_model_path)
+                self.lstm_model = model
+            except Exception as e:
+                self.latest_lstm_status = f"MODEL ERROR: {e}"
+                return
+
+        while self.is_running:
+            frames_snapshot = None
+            with self.buffer_lock:
+                buf_len = len(self.sequence_buffer)
+                if buf_len > 0:
+                    if buf_len < 15:
+                        # Pad short sequences by repeating last frame (matching training pipeline)
+                        pad_count = 15 - buf_len
+                        last_f = self.sequence_buffer[-1]
+                        frames_snapshot = list(self.sequence_buffer) + [last_f] * pad_count
+                    else:
+                        frames_snapshot = list(self.sequence_buffer)
+
+            if frames_snapshot is None:
+                time.sleep(0.04)
+                continue
+
+            try:
+                seq_tensor = np.expand_dims(np.array(frames_snapshot, dtype=np.float32), axis=0)
+                # Model inference forward pass
+                prob = float(model(seq_tensor, training=False)[0, 0])
+                self.latest_fall_prob = prob
+                self.last_lstm_time = time.time()
+                self.lstm_inference_count += 1
+
+                timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                if prob >= self.lstm_threshold:
+                    self.latest_lstm_status = "FALL_ALERT"
+                    if not self.lstm_alert_latched:
+                        self.lstm_alert_latched = True
+                        with self.frame_lock:
+                            raw_f = self.latest_raw_frame.copy() if self.latest_raw_frame is not None else None
+                            ann_f = self.latest_annotated_frame.copy() if self.latest_annotated_frame is not None else raw_f
+                        if raw_f is not None and ann_f is not None:
+                            self._handle_lstm_fall_event(prob, raw_f, ann_f, timestamp_str)
+                else:
+                    if prob < max(0.0, self.lstm_threshold - 0.10):
+                        self.latest_lstm_status = "NORMAL"
+                        self.lstm_alert_latched = False
+            except Exception:
+                pass
+
+            time.sleep(0.04)
+
+    def _handle_lstm_fall_event(self, prob: float, raw_frame, annotated_frame, timestamp_str):
+        """Processes confirmed MobileNetV2-LSTM fall event: saves evidence snapshot, logs incident, triggers alarm."""
+        fall_time_sec = round(time.time() - self.start_time, 2) if self.start_time else 0.0
+        incident_id = f"inc_{int(time.time())}_lstm"
+        snapshot_filename = f"{incident_id}.jpg"
+        snapshot_path = os.path.join(self.incident_dir, snapshot_filename)
+
+        try:
+            cv2.imwrite(snapshot_path, annotated_frame)
+        except Exception:
+            pass
+
+        incident_record = {
+            "timestamp": timestamp_str,
+            "fall_time_sec": fall_time_sec,
+            "camera_id": self.source_label,
+            "track_id": 1,
+            "severity": "CRITICAL" if prob >= 0.80 else "HIGH" if prob >= 0.65 else "MEDIUM",
+            "torso_angle": 0.0,
+            "descent_velocity": 0.0,
+            "aspect_ratio": 0.0,
+            "confidence": round(prob, 4),
+            "snapshot_file": snapshot_filename,
+            "status": "UNACKNOWLEDGED"
+        }
+
+        self.last_incident_info = incident_record
+        self.incidents_history.insert(0, incident_record)
+
+        try:
+            df_new = pd.DataFrame([incident_record])
+            df_new.to_csv(self.csv_log_path, mode="a", header=False, index=False)
+        except Exception:
+            pass
+
+        with self.alarm_lock:
+            self.alarm_active = True
+            self.alarm_muted = False
+            self.alarm_acknowledged = False
+
+    def get_lstm_metrics(self) -> Dict[str, Any]:
+        """Returns thread-safe MobileNetV2-LSTM telemetry and status."""
+        return {
+            "latest_fall_prob": self.latest_fall_prob,
+            "latest_lstm_status": self.latest_lstm_status,
+            "lstm_threshold": self.lstm_threshold,
+            "lstm_inference_count": self.lstm_inference_count,
+            "buffer_size": len(self.sequence_buffer),
+            "alert_latched": self.lstm_alert_latched,
+            "last_lstm_time": self.last_lstm_time
+        }
 
     def get_latest_frame(self, return_raw: bool = False):
         """Returns the latest frame (annotated or raw), connection status, fps, alarm status, and elapsed seconds."""
@@ -429,6 +589,9 @@ class CameraStreamManager:
         if self.detector:
             self.detector.acknowledge_tracker_alerts()
 
+        # Latch ongoing LSTM alert so it does not re-trigger while person remains down
+        self.lstm_alert_latched = True
+
         if self.last_incident_info:
             self.last_incident_info["status"] = "ACKNOWLEDGED"
 
@@ -446,6 +609,10 @@ class CameraStreamManager:
 
         if self.detector:
             self.detector.reset_tracker_alerts()
+
+        # Reset LSTM latch and status
+        self.lstm_alert_latched = False
+        self.latest_lstm_status = "NORMAL"
 
         if self.last_incident_info:
             self.last_incident_info["status"] = "SYSTEM_RESET"
@@ -465,6 +632,14 @@ class CameraStreamManager:
             self.alarm_acknowledged = False
             self.last_incident_info = None
             self.incidents_history.clear()
+
+        # Reset MobileNetV2-LSTM sequence buffer and status
+        with self.buffer_lock:
+            self.sequence_buffer.clear()
+        self.latest_fall_prob = 0.0
+        self.latest_lstm_status = "INITIALIZING"
+        self.lstm_alert_latched = False
+        self.lstm_inference_count = 0
 
         # 2. Reset frame buffers and counters under frame_lock
         with self.frame_lock:

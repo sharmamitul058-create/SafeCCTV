@@ -1,0 +1,36 @@
+{
+  "model_path": "/content/SafeCCTV/research_model/checkpoints/best_fall_model.keras",
+  "metrics": {
+    "samples": 26,
+    "threshold": 0.5,
+    "accuracy": 1.0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1_score": 1.0,
+    "confusion_matrix": {
+      "tn": 14,
+      "fp": 0,
+      "fn": 0,
+      "tp": 12,
+      "matrix_2x2": [
+        [
+          14,
+          0
+        ],
+        [
+          0,
+          12
+        ]
+      ]
+    },
+    "classification_report": "                precision    recall  f1-score   support\n\nADL/Normal (0)       1.00      1.00      1.00        14\n      Fall (1)       1.00      1.00      1.00        12\n\n      accuracy                           1.00        26\n     macro avg       1.00      1.00      1.00        26\n  weighted avg       1.00      1.00      1.00        26\n"
+  },
+  "latency": {
+    "warmup_runs": 5,
+    "benchmark_runs": 25,
+    "avg_latency_ms": 2949.47,
+    "std_latency_ms": 181.82,
+    "p95_latency_ms": 3023.09,
+    "throughput_fps": 0.34
+  }
+}

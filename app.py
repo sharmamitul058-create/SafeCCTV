@@ -167,11 +167,21 @@ with tab_live:
         show_raw = (display_mode == "Original (Unannotated Frame)")
 
         st.divider()
-        st.markdown("#### ⚙️ **Detection Heuristics**")
-        st.caption("• **Descent Velocity**: `> 20.0 px/window`")
-        st.caption("• **Torso Tilt Angle**: `≥ 55.0° (Prone)`")
-        st.caption("• **Aspect Ratio**: `≥ 1.05 (Horizontal)`")
-        st.caption("• **Resting Window**: `3 frames`")
+        st.markdown("#### 🧠 **Fall Detection Model**")
+        st.info("🧠 **MobileNetV2-LSTM** (15 frames @ 3 FPS)")
+        live_thresh = st.slider(
+            "Live Fall Threshold",
+            min_value=0.10,
+            max_value=0.95,
+            value=float(stream_manager.lstm_threshold),
+            step=0.05,
+            help="Prediction probability threshold for live MobileNetV2-LSTM fall detection."
+        )
+        stream_manager.lstm_threshold = live_thresh
+
+        st.caption("• **Architecture**: `MobileNetV2 + LSTM`")
+        st.caption("• **Input**: `15 frames @ 3 FPS (224x224)`")
+        st.caption("• **Decision**: `P(Fall) >= Threshold`")
 
         st.divider()
         st.markdown("#### 🔔 **Alarm Siren Status**")
@@ -306,9 +316,11 @@ with tab_live:
 
         m_col3, m_col4 = st.columns(2)
         with m_col3:
-            ui_metric_time = st.empty()
+            ui_metric_lstm = st.empty()
         with m_col4:
             ui_metric_falls = st.empty()
+
+        ui_metric_time = st.empty()
 
         st.markdown("#### 📸 **Recent Fall Incident Evidence**")
         ui_incident_placeholder = st.empty()
@@ -360,10 +372,12 @@ with tab_live:
         </div>
         """, unsafe_allow_html=True)
 
-        ui_metric_time.markdown(f"""
+        prob_val = stream_manager.latest_fall_prob
+        prob_color = "#ef4444" if prob_val >= stream_manager.lstm_threshold else ("#f59e0b" if prob_val >= 0.35 else "#38bdf8")
+        ui_metric_lstm.markdown(f"""
         <div class="metric-card">
-            <div class="metric-lbl">Monitoring Time</div>
-            <div class="metric-val" style="color: #e2e8f0;">{elapsed_sec:.1f} <span style="font-size:0.9rem;">sec</span></div>
+            <div class="metric-lbl">LSTM Fall Prob</div>
+            <div class="metric-val" style="color: {prob_color};">{prob_val * 100:.1f}%</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -373,6 +387,13 @@ with tab_live:
         <div class="metric-card">
             <div class="metric-lbl">Falls Confirmed</div>
             <div class="metric-val" style="color: {fall_color};">{fall_count}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        ui_metric_time.markdown(f"""
+        <div class="metric-card" style="margin-top:-4px;">
+            <div class="metric-lbl">Monitoring Time</div>
+            <div class="metric-val" style="color: #e2e8f0;">{elapsed_sec:.1f} <span style="font-size:0.9rem;">sec</span></div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -389,8 +410,7 @@ with tab_live:
                     • <b>Estimated Fall Time:</b> <span style="color:#fbbf24; font-weight:700;">{inc.get('fall_time_sec', 0.0)} seconds</span> after start<br>
                     • <b>Timestamp:</b> {inc.get('timestamp')}<br>
                     • <b>Camera ID:</b> {inc.get('camera_id')}<br>
-                    • <b>Track ID:</b> Person #{inc.get('track_id')}<br>
-                    • <b>Torso Tilt:</b> {inc.get('torso_angle')}° | <b>Descent Speed:</b> {inc.get('descent_velocity'):+.1f} px<br>
+                    • <b>Model:</b> <span style="color:#a78bfa; font-weight:600;">MobileNetV2-LSTM</span> (Confidence: {inc.get('confidence', 0.8) * 100:.1f}%)<br>
                     • <b>Status:</b> <span style="color:#38bdf8; font-weight:600;">{inc.get('status')}</span>
                 </div>
             </div>
@@ -440,13 +460,40 @@ with tab_live:
 # =============================================================================
 with tab_upload:
     st.subheader("📁 Uploaded Video Fall Analysis")
-    st.caption("Upload prerecorded CCTV footage to test detection heuristics offline with simulated progress.")
+    st.caption("Upload prerecorded CCTV footage to run deep learning fall detection with our trained MobileNetV2-LSTM model or heuristic simulation.")
 
-    upload_col1, upload_col2 = st.columns([1, 1], gap="medium")
+    upload_col1, upload_col2 = st.columns([1.1, 0.9], gap="medium")
     uploaded_video_path = None
     uploaded_video_name = None
 
     with upload_col1:
+        st.markdown("##### ⚙️ **Detection Engine & Parameters**")
+        detector_engine = st.radio(
+            "Detection Engine",
+            options=["MobileNetV2-LSTM (Trained Model)", "Mock Simulation (Heuristic Mode)"],
+            index=0,
+            horizontal=True,
+            help="Select the trained MobileNetV2-LSTM neural network or the mock simulation."
+        )
+
+        c_p1, c_p2 = st.columns([1, 1])
+        with c_p1:
+            decision_threshold = st.slider(
+                "Fall Decision Threshold",
+                min_value=0.10,
+                max_value=0.95,
+                value=0.50,
+                step=0.05,
+                help="Prediction probability threshold for fall classification (default: 0.50)."
+            )
+        with c_p2:
+            model_path_env = os.environ.get("FALL_MODEL_PATH", "research_model/best_fall_model.keras")
+            custom_model_path = st.text_input(
+                "Model Weights Path",
+                value=model_path_env,
+                help="Path to the trained .keras weights file."
+            )
+
         up_file = st.file_uploader(
             "Upload Prerecorded MP4/AVI Video",
             type=["mp4", "avi", "mov", "mkv"],
@@ -479,10 +526,15 @@ with tab_upload:
             status_lbl.markdown(f"**Progress:** {msg}")
 
         try:
-            detector = get_detector(use_real_model=False)
+            use_real = (detector_engine == "MobileNetV2-LSTM (Trained Model)")
+            detector = get_detector(
+                use_real_model=use_real,
+                model_path=custom_model_path,
+                threshold=decision_threshold
+            )
             res: AnalysisResult = detector.analyze_video(uploaded_video_path, progress_callback=offline_progress_cb)
             st.session_state["offline_result"] = res
-            st.success("✅ Offline video analysis complete!")
+            st.success("✅ Video analysis complete!")
         except Exception as e:
             st.error(f"❌ Error during analysis: {e}")
 
@@ -491,10 +543,48 @@ with tab_upload:
         st.divider()
         st.markdown("#### **Analysis Results & Annotated Video**")
 
+        # Summary Metric Cards
+        s_col1, s_col2, s_col3, s_col4 = st.columns(4)
+        with s_col1:
+            risk_color = "#ef4444" if off_res.fall_detected else "#22c55e"
+            status_text = "FALL DETECTED" if off_res.fall_detected else "NORMAL"
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-lbl">Analysis Result</div>
+                <div class="metric-val" style="color: {risk_color}; font-size:1.2rem;">{status_text}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with s_col2:
+            max_prob = max([ev.confidence for ev in off_res.fall_events]) if off_res.fall_events else (
+                max([t.get("fall_probability", 0.0) for t in off_res.telemetry_data]) if off_res.telemetry_data else 0.0
+            )
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-lbl">Peak Fall Prob</div>
+                <div class="metric-val" style="color: #38bdf8;">{max_prob * 100:.1f}%</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with s_col3:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-lbl">Sequences Evaluated</div>
+                <div class="metric-val" style="color: #e2e8f0;">{len(off_res.telemetry_data)}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with s_col4:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-lbl">Processing Time</div>
+                <div class="metric-val" style="color: #facc15;">{off_res.processing_time_sec:.1f}s</div>
+            </div>
+            """, unsafe_allow_html=True)
+
         tab_ann, tab_orig = st.tabs(["📺 Annotated Preview", "📹 Source Video"])
         with tab_ann:
             if off_res.annotated_video_path and os.path.exists(off_res.annotated_video_path):
                 st.video(off_res.annotated_video_path)
+            else:
+                st.info("No annotated preview video generated.")
         with tab_orig:
             if off_res.video_path and os.path.exists(off_res.video_path):
                 st.video(off_res.video_path)
@@ -512,3 +602,10 @@ with tab_upload:
                 "Triggers": " | ".join(ev.condition_triggers)
             } for ev in off_res.fall_events]
             st.dataframe(pd.DataFrame(events_data), use_container_width=True, hide_index=True)
+        else:
+            st.info("🟢 No fall events detected. All evaluated sequences remained below the decision threshold.")
+
+        if off_res.telemetry_data:
+            with st.expander("📈 Temporal Sequence Prediction Breakdown (Raw Telemetry)"):
+                st.dataframe(pd.DataFrame(off_res.telemetry_data), use_container_width=True, hide_index=True)
+
