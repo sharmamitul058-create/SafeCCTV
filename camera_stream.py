@@ -18,6 +18,32 @@ from collections import deque
 from typing import Optional, Dict, Any, List
 from fall_detector import RealtimeFallDetector
 
+# -----------------------------------------------------------------------------
+# No‑op detector used when YOLO is disabled for live streaming.
+# It simply returns the input frame unchanged and no fall events.
+# -----------------------------------------------------------------------------
+class NoOpDetector:
+    """Placeholder detector that performs no inference.
+
+    The real MobileNetV2‑LSTM pipeline runs in a separate background thread.
+    For the live UI we only need an annotated frame (which can be the raw frame)
+    and an empty list of new events.
+    """
+
+    def __init__(self, *_, **__):
+        pass
+
+    def process_frame(self, frame, timestamp_str=""):
+        # Return a copy to avoid mutating the original frame elsewhere.
+        return frame.copy(), []
+
+    def clear_all_tracks(self):
+        pass
+
+    def reset(self):
+        pass
+
+
 
 def sanitize_camera_source(source: Any) -> str:
     """Masks passwords from RTSP URLs to prevent credential leakage in logs and UI."""
@@ -75,6 +101,7 @@ class CameraStreamManager:
         self.lstm_threshold = float(os.environ.get("FALL_THRESHOLD", 0.50))
         self.lstm_model = None
         self.sequence_buffer = deque(maxlen=15)
+        self.sequence_sample_id = 0
         self.buffer_lock = threading.Lock()
         self.latest_fall_prob = 0.0
         self.latest_lstm_status = "INITIALIZING"
@@ -98,7 +125,7 @@ class CameraStreamManager:
         self._init_csv_log()
 
         # Initialize detector
-        self.detector = RealtimeFallDetector(model_path="yolov8n-pose.pt")
+        self.detector = NoOpDetector()
 
         # Audio thread (sounds ONLY when alarm_active is True and not muted)
         self.audio_running = True
@@ -149,6 +176,7 @@ class CameraStreamManager:
 
         with self.buffer_lock:
             self.sequence_buffer.clear()
+            self.sequence_sample_id = 0
         self.latest_fall_prob = 0.0
         self.latest_lstm_status = "INITIALIZING"
         self.lstm_alert_latched = False
@@ -306,6 +334,7 @@ class CameraStreamManager:
                     rgb_frame = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32)
                     with self.buffer_lock:
                         self.sequence_buffer.append(rgb_frame)
+                        self.sequence_sample_id += 1
                     self.last_sample_time = now_sample
                 except Exception:
                     pass
@@ -406,11 +435,15 @@ class CameraStreamManager:
                 self.latest_lstm_status = f"MODEL ERROR: {e}"
                 return
 
+        last_processed_seq_id = -1
         while self.is_running:
             frames_snapshot = None
+            current_seq_id = -1
             with self.buffer_lock:
                 buf_len = len(self.sequence_buffer)
-                if buf_len > 0:
+                # Only execute inference if frames exist and sequence has changed since last prediction
+                if buf_len > 0 and self.sequence_sample_id != last_processed_seq_id:
+                    current_seq_id = self.sequence_sample_id
                     if buf_len < 15:
                         # Pad short sequences by repeating last frame (matching training pipeline)
                         pad_count = 15 - buf_len
@@ -420,7 +453,7 @@ class CameraStreamManager:
                         frames_snapshot = list(self.sequence_buffer)
 
             if frames_snapshot is None:
-                time.sleep(0.04)
+                time.sleep(0.02)
                 continue
 
             try:
@@ -430,6 +463,7 @@ class CameraStreamManager:
                 self.latest_fall_prob = prob
                 self.last_lstm_time = time.time()
                 self.lstm_inference_count += 1
+                last_processed_seq_id = current_seq_id
 
                 timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -446,10 +480,11 @@ class CameraStreamManager:
                     if prob < max(0.0, self.lstm_threshold - 0.10):
                         self.latest_lstm_status = "NORMAL"
                         self.lstm_alert_latched = False
-            except Exception:
-                pass
+            except Exception as e:
+                self.latest_lstm_status = f"INFERENCE ERROR: {e}"
+                last_processed_seq_id = current_seq_id
 
-            time.sleep(0.04)
+            time.sleep(0.02)
 
     def _handle_lstm_fall_event(self, prob: float, raw_frame, annotated_frame, timestamp_str):
         """Processes confirmed MobileNetV2-LSTM fall event: saves evidence snapshot, logs incident, triggers alarm."""
@@ -636,6 +671,7 @@ class CameraStreamManager:
         # Reset MobileNetV2-LSTM sequence buffer and status
         with self.buffer_lock:
             self.sequence_buffer.clear()
+            self.sequence_sample_id = 0
         self.latest_fall_prob = 0.0
         self.latest_lstm_status = "INITIALIZING"
         self.lstm_alert_latched = False
@@ -655,7 +691,7 @@ class CameraStreamManager:
             self.fps = 0.0
 
         # 3. Reset fall detector tracker and dynamics
-        if self.detector:
+        if self.detector and hasattr(self.detector, "clear_all_tracks"):
             self.detector.clear_all_tracks()
 
         # 4. Safely delete snapshot files in incidents directory (only .jpg files)

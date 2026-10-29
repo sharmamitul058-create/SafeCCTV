@@ -160,9 +160,9 @@ with tab_live:
         st.markdown("#### 🔍 **Feed Display Mode**")
         display_mode = st.radio(
             "Display Mode",
-            options=["Annotated (YOLO Pose & HUD)", "Original (Unannotated Frame)"],
+            options=["Annotated (MobileNetV2-LSTM HUD)", "Original (Unannotated Frame)"],
             index=0,
-            help="Toggle between real-time YOLO pose fall detection view and the clean raw webcam frame."
+            help="Toggle between real-time MobileNetV2-LSTM fall detection view and the clean raw webcam frame."
         )
         show_raw = (display_mode == "Original (Unannotated Frame)")
 

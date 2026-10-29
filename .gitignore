@@ -18,3 +18,7 @@ ENV/
 .idea/
 *.swp
 *.swo
+
+# Runtime Incident Snapshots
+incidents/*.jpg
+incidents/*.png
